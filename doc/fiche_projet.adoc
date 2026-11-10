@@ -1,0 +1,462 @@
+= Conception d'un SoC RISC-V capable de démarrer Linux
+Mouad Zouhdi
+:doctype: article
+:toc:
+:toclevels: 3
+:sectnums:
+:icons: font
+:lang: fr
+:revnumber: 0.6
+:revdate: 2026-11-09
+
+[abstract]
+Fiche projet décrivant les objectifs, les choix d'architecture, les outils, la méthodologie et l'ordre des tâches pour concevoir un SoC RISC-V maison capable de démarrer Linux, d'abord sur un cœur pipeliné in-order, puis superscalaire, puis out-of-order. Le projet est mené entièrement en simulation, le passage sur carte FPGA étant un bonus.
+
+== Objectifs
+
+=== Objectif principal
+
+Concevoir seul, de la spécification jusqu'au démarrage de Linux en simulation, un SoC RISC-V 32 bits synthétisable et prêt pour FPGA, avec une qualité de travail proche de celle d'une équipe de conception CPU en entreprise.
+
+=== Objectifs secondaires
+
+* Rendre le profil attractif pour les postes de conception et de vérification de microprocesseurs.
+* Apprendre les outils et pratiques actuels de l'industrie : SystemVerilog, Verilator, co-simulation, vérification formelle, intégration continue.
+* Documenter tout le parcours (journal de bord, schémas, bugs, mesures) pour produire ensuite une série de vidéos en français et en anglais.
+
+=== Critères de réussite
+
+[cols="1,3",options="header"]
+|===
+| Jalon | Critère vérifiable
+| M1 | Cœur RV32IM pipeliné validé par riscv-arch-test et par co-simulation avec Spike.
+| M2 | SoC complet (caches, AXI, périphériques) exécutant CoreMark en simulation, performance mesurée et comparée à l'estimation.
+| M3 | SoC synthétisé et implémenté sous Vivado pour l'Artix-7 100T avec le contrôleur DDR (MIG) et les contraintes de la Nexys A7, timing tenu à la fréquence cible, sans carte.
+| M4 | OpenSBI puis Linux démarrent jusqu'au shell en simulation.
+| M5 | Version superscalaire de largeur 2, gain mesuré et expliqué, Linux démarre toujours.
+| M6 | Version out-of-order validée par riscv-arch-test, la co-simulation et CoreMark, gain mesuré et expliqué. Objectif étendu : Linux démarre sur le cœur out-of-order.
+| Bonus | Linux démarre sur une carte Nexys A7, si une carte devient disponible.
+|===
+
+== Périmètre technique
+
+=== Jeu d'instructions
+
+Le périmètre ISA est découpé en deux lots, à ne pas confondre avec les phases de l'ordre des tâches :
+
+* Lot 1 (jalons M1 à M3) : RV32IM avec Zicsr, Zicntr et Zifencei, mode machine uniquement. Zifencei est nécessaire dès l'arrivée des caches, pour la cohérence entre caches d'instructions et de données.
+* Lot 2 (jalon M4) : ajout de l'extension A, des modes superviseur et utilisateur et de la mémoire virtuelle Sv32. RV32IMA avec Zicsr et Zifencei est le minimum accepté par Linux.
+* Hors périmètre : extensions C, F, D, V, B, hyperviseur. Le noyau et l'espace utilisateur seront compilés pour `rv32ima` en flottant logiciel.
+
+Le jeu d'instructions est défini par la spécification RISC-V. Le travail de conception porte sur la microarchitecture, c'est-à-dire la manière d'exécuter ces instructions, puis sur sa traduction en RTL.
+
+Bien que le lot 2 ne soit implémenté qu'en phase 6, ses exigences structurantes (atomiques, privilège effectif, traduction d'adresses, fautes de page) sont lues et intégrées aux interfaces dès la phase 1, sous forme de signaux inactifs au lot 1. C'est ce qui évite de reprendre les interfaces du cœur et des caches plus tard.
+
+=== Microarchitecture du cœur
+
+[cols="1,2,3",options="header"]
+|===
+| Élément | Choix | Justification
+| Pipeline | 5 étages : IF, DEC, EXE, MEM, WBK | Référence classique (Hennessy et Patterson), très documentée, confronte à tous les problèmes fondamentaux : aléas de données, forwarding, aléas de contrôle, bulles. RISC-V s'y prête naturellement.
+| Largeur | 1 au départ, puis 2 | La largeur (instructions par cycle) est indépendante de la profondeur. Passer à 2 voies est un bond de complexité : dépendances intra-cycle, ports supplémentaires du banc de registres, chemins de forwarding multipliés, bande passante de chargement.
+| Forwarding | Bypass depuis les registres de pipeline EXE/MEM et MEM/WBK vers l'entrée de EXE, bypass interne au banc de registres pour WBK vers DEC | Emplacement des bypass à démontrer avant et après le passage superscalaire. Un load suivi d'une utilisation immédiate impose une bulle d'un cycle.
+| Prédiction de branchement | Statique « non pris », puis tampon des cibles de branchement (BTB), compteurs saturants 2 bits et pile d'adresses de retour (RAS), puis éventuellement gshare | Progression mesurable : taux de mauvaise prédiction relevé sur CoreMark à chaque étape.
+| Multiplication | Pipelinée sur les DSP, latence fixe de 2 cycles répartie sur EXE et MEM, un registre DSP par étage | Le résultat arrive en WBK dans l'ordre du programme, comme un load : pas d'écriture hors ordre, pas de conflit sur le port d'écriture, exceptions et retrait RVFI restent ordonnés. L'unité d'aléas insère une bulle si l'instruction suivante utilise le résultat. Une latence plus longue casserait ces propriétés.
+| Division | Itérative sur 32 cycles | Simple, faible surface. Le pipeline est gelé pendant le calcul. Division par zéro et dépassement ont des résultats définis par la spec, sans exception.
+| Endianness | Little-endian | Défaut de RISC-V, utilisé par Linux et toute la chaîne d'outils.
+| Accès non alignés | Exception. À partir du lot 2, OpenSBI les émule en logiciel | Simplifie fortement le matériel.
+| Évolution | Out-of-order en dernière étape | Plus rare et plus valorisant, mais n'a de sens qu'une fois l'infrastructure de vérification et le SoC solides.
+|===
+
+=== Exceptions, interruptions et CSR
+
+* Exceptions précises : MEM est le point de validation, aucune instruction ne pouvant fauter après cet étage, et les écritures de CSR s'y font. Les fautes des étages précédents (instruction illégale, faute de page instruction) sont donc connues avant MEM. Les fautes de page et de permission des loads et stores, connues pendant MEM puisque le D-TLB est consulté en même temps que le cache VIPT, sont vérifiées dans le même cycle avant l'activation de toute écriture de cache ou requête de bus. Les accès non cachables attendent en MEM la réponse du bus. Aucun accès à effet de bord ne peut ainsi s'exécuter pour une instruction fautive ou derrière une instruction plus ancienne qui a fauté : une lecture du FIFO de réception de l'UART, par exemple, le dépile.
+* Ordre de priorité des exceptions conforme au volume II.
+* Point d'injection des interruptions défini dans la spec.
+* Le pipeline est vidé et rechargé après toute écriture de CSR à effet de bord (`satp`, `mstatus`), et après FENCE.I, SFENCE.VMA, MRET, SRET et WFI.
+* Le CSR `time` reflète `mtime` du CLINT, pour éviter l'émulation très lente de `rdtime` par OpenSBI.
+* Erreurs de bus : un esclave AXI par défaut répond par une erreur (DECERR) aux adresses non mappées. Les erreurs sur chargement d'instruction, load et accès non cachable non posté (qui attend sa réponse en MEM) produisent une faute d'accès précise. Les erreurs sur des écritures postées, c'est-à-dire l'éviction d'une ligne sale ou un store passé par le tampon d'écriture de la version write-through, sont par nature imprécises : leur politique (interruption, blocage) est fixée dans la spec.
+
+CSR du lot 1 : `misa`, `mvendorid`, `marchid`, `mimpid`, `mhartid`, `mstatus` (MIE, MPIE, MPP), `mtvec`, `mie`, `mip`, `mscratch`, `mepc`, `mcause`, `mtval`, `mcycle`, `minstret` et leurs moitiés hautes `mcycleh`, `minstreth`, ainsi que les compteurs en lecture seule `cycle`, `time`, `instret` et leurs moitiés `cycleh`, `timeh`, `instreth`. WFI est décodé dès le lot 1, comme un NOP : c'est une instruction obligatoire.
+
+Ajouts du lot 2 : CSR superviseur, `medeleg`, `mideleg`, `mcounteren` et `scounteren` (sans `mcounteren.TM`, chaque `rdtime` de Linux en mode S provoque un trap), bits MPRV, SUM et MXR de `mstatus` (OpenSBI utilise MPRV pour lire l'instruction fautive et émuler les accès non alignés : la MMU doit traduire les accès de données du mode M quand MPRV vaut 1), `mip.STIP` inscriptible par le mode M (OpenSBI relaie ainsi le timer vers le mode S), bits TW, TSR et TVM.
+
+Ces choix sont à figer dans la spec avant le RTL : ils sont parmi les plus coûteux à modifier après coup.
+
+=== Hiérarchie mémoire
+
+[cols="1,2,3",options="header"]
+|===
+| Élément | Choix | Justification
+| Niveaux | Un seul niveau, L1 | À basse fréquence sur FPGA, la latence DDR en cycles reste modérée. Un L2 coûterait beaucoup de BRAM et de complexité pour peu de gain. Réévalué après mesures.
+| Organisation | Caches d'instructions (I-cache) et de données (D-cache) séparés | Évite le conflit structurel entre IF et MEM au même cycle. Standard dans quasiment tous les processeurs.
+| Taille et associativité | 16 Ko, 4 voies | 4 Ko par voie : index et offset tombent dans l'offset de page Sv32. Le cache peut être indexé virtuellement pendant que le TLB traduit, puis comparé physiquement (VIPT sans alias). Repli possible : 8 Ko, 2 voies, LRU exact.
+| Taille de ligne | 32 octets | Bon compromis entre latence de remplissage DDR2 et localité spatiale pour un cœur 32 bits.
+| Remplacement | Pseudo-LRU en arbre (3 bits par ensemble) | Proche du vrai LRU à 4 voies pour un coût réduit. Bits stockés en bascules ou LUTRAM, séparément de la BRAM des données, pour éviter les conflits d'accès.
+| Politique d'écriture (D-cache) | Write-through avec tampon d'écriture dans un premier temps, puis write-back avec allocation sur écriture | La version write-through valide le reste du système plus tôt et fournit un point de comparaison mesuré. Le write-back réduit ensuite fortement le trafic mémoire.
+| Type | Caches bloquants | Simples. Évolution vers des caches non bloquants, avec des registres de suivi des défauts en vol (MSHR), envisagée avec l'out-of-order.
+| Cohérence I/D | FENCE.I invalide le I-cache et réécrit en mémoire les lignes sales du D-cache | Requis pour le code auto-modifiant et le chargement de programmes sous Linux.
+| Régions non cachables | Attribut par région dans la carte mémoire | Les accès aux périphériques ne doivent jamais passer par le cache : le D-cache les transmet directement au bus.
+| Indexation et étiquettes | Index et offset contenus dans les 12 bits de poids faible. Étiquettes dimensionnées dès le départ pour l'adresse physique | L'index est compatible VIPT dès la phase 4. En revanche, le chemin d'étiquette et de fautes devra être étendu au lot 2 : comparaison avec le numéro de page physique fourni par le TLB, gel du pipeline sur défaut de TLB, remontée des fautes. Sv32 produit des adresses physiques de 34 bits : la spec fixe soit des étiquettes de 34 bits, soit une faute d'accès pour toute adresse physique au-delà de l'espace implémenté.
+|===
+
+Tous les paramètres de cache sont des paramètres SystemVerilog, et la mémoire principale est vue derrière une interface AXI. Le cœur et les caches restent ainsi indépendants de la carte.
+
+=== Mémoire virtuelle
+
+* Sv32 avec support des mégapages de 4 Mo, utilisées par Linux pour le noyau.
+* TLB séparés instructions et données, entièrement associatifs, de petite taille.
+* ASID ignorés au départ : SFENCE.VMA vide tout le TLB.
+* Parcoureur de tables de pages matériel. Une faute de page est levée quand les bits A ou D d'une entrée de table de pages (PTE) doivent être mis à jour, Linux sait la gérer.
+* Le parcoureur lit les tables de pages à travers le D-cache, et non directement en mémoire : Linux écrit les PTE avec des stores ordinaires, qui peuvent rester dans des lignes sales d'un cache write-back. Un parcoureur branché directement sur le bus lirait des valeurs périmées.
+* Les accès de données du mode M sont traduits quand `mstatus.MPRV` vaut 1, avec le privilège indiqué par MPP.
+* PMP implémenté avec zéro entrée au départ, ce qu'OpenSBI gère. Sans PMP, la mémoire d'OpenSBI n'est protégée que par le nœud `reserved-memory` du device tree.
+
+=== SoC et périphériques
+
+[cols="1,3",options="header"]
+|===
+| Bloc | Rôle et choix
+| Interconnexion | AXI4 pour le chemin mémoire, AXI4-Lite pour les périphériques. Arbitre entre I-cache et D-cache (le parcoureur de tables passe par le D-cache), décodage d'adresses, esclave par défaut pour les adresses non mappées. AMBA est le standard de fait dans l'industrie, et le MIG de Xilinx expose une interface AXI4. Usage simplifié au départ : un seul identifiant de transaction, rafales de la taille d'une ligne.
+| CLINT | Core-Local Interruptor : `mtime`, `mtimecmp`, `msip`, avec la carte de registres du CLINT de SiFive, reconnue par OpenSBI via le device tree (`sifive,clint0`). Placé à l'adresse `0x0200_0000` pour s'aligner sur Spike et simplifier la co-simulation (à confirmer). OpenSBI et Linux n'imposent pas cette adresse : ils la lisent dans le device tree. Indispensable : OpenSBI fournit le timer à Linux à partir de lui, à travers l'interface SBI (Supervisor Binary Interface).
+| UART | Carte de registres compatible UART Lite de Xilinx (4 registres : réception, émission, état, contrôle). OpenSBI la reconnaît dans le device tree via la chaîne `xlnx,xps-uartlite-1.00.a`, ce qui évite d'écrire un pilote. Les registres à effet de bord (lecture qui dépile le FIFO de réception, remise à zéro des FIFO par le registre de contrôle) sont déclarés comme registres externes dans SystemRDL, pour que PeakRDL expose les signaux d'accès correspondants.
+| ROM de démarrage | En BRAM. Code exécuté au reset et device tree du SoC. Elle saute vers OpenSBI en DDR avec, selon la convention de démarrage RISC-V, l'identifiant du hart dans `a0` et l'adresse du device tree dans `a1`. OpenSBI est construit en mode `fw_payload`, avec le noyau Linux en charge utile. En simulation, l'image (OpenSBI, Linux, initramfs) est préchargée directement dans le modèle mémoire par le banc de test : la transférer par une UART simulée bit par bit prendrait des jours. Le chargeur d'image par UART n'est utile que pour le bonus FPGA.
+| Séquenceur de reset | Libère le cœur une fois la mémoire prête. En simulation, le modèle mémoire fournit un signal de disponibilité qui imite la fin de calibration DDR, pour que le séquenceur soit déjà conforme à l'intégration du MIG.
+| Mémoire principale | Modèle mémoire AXI en simulation, avec une latence configurable proche de celle d'une DDR2. En synthèse dès la phase 5 : contrôleur MIG de Xilinx généré pour la Nexys A7, branché sur la même interface AXI.
+| Horloges | Une seule horloge en simulation au départ. La phase 5 décide si le SoC tourne sur l'horloge utilisateur du MIG ou s'il faut un franchissement de domaine d'horloge, auquel cas celui-ci est aussi ajouté en simulation.
+| Console Linux | Sans PLIC, Linux utilise la console SBI : `earlycon=sbi` puis la console HVC SBI du noyau (`console=hvc0`), en interrogation et sans interruption. Elle passe par OpenSBI, qui pilote l'UART. Dans les noyaux récents, cette console s'appuie sur l'extension SBI de console de débogage (DBCN), qu'OpenSBI fournit depuis sa version 1.3 : les versions du noyau et d'OpenSBI sont choisies en conséquence. Aucun pilote à écrire.
+| Optionnels | PLIC (interruptions externes, pour une console Linux pilotée par interruption), SPI pour microSD, GPIO vers LED et interrupteurs pour le débogage.
+|===
+
+Les blocs de registres des périphériques sont décrits en SystemRDL. PeakRDL génère le bloc de registres SystemVerilog avec son interface de bus, l'en-tête C et la documentation. La logique fonctionnelle reste écrite à la main. Une seule source de vérité garde matériel, pilote et documentation synchronisés.
+
+Linux démarre avec un initramfs intégré à l'image, sans disque ni swap. 128 Mo de mémoire principale suffisent largement.
+
+=== Device tree
+
+Le device tree décrit le SoC à OpenSBI et à Linux. Il contient au minimum :
+
+* le nœud CPU avec `riscv,isa-base` et `riscv,isa-extensions`, ainsi que l'ancienne propriété `riscv,isa` (par exemple `rv32ima_zicsr_zifencei_zicntr` au lot 2), qu'OpenSBI était seul à lire avant mi-2024 et qui sert de repli, `mmu-type = "riscv,sv32"` et son contrôleur d'interruptions local (`riscv,cpu-intc`) ;
+* `timebase-frequency`, la fréquence de `mtime` ;
+* la mémoire, avec un nœud `reserved-memory` pour OpenSBI ;
+* le CLINT avec `interrupts-extended`, et l'UART ;
+* `chosen`, avec `bootargs` (`earlycon=sbi console=hvc0`) et `stdout-path`.
+
+En simulation, `timebase-frequency` et la cadence de `mtime` fixent le nombre de cycles entre deux ticks du noyau : c'est un levier direct sur la durée du démarrage simulé.
+
+=== Machines à états
+
+Le pipeline n'est pas une machine à états : c'est un chemin de données dont le contrôle (bulles, vidages, forwarding) est combinatoire, de même que le décodeur.
+
+Dans le cœur et la hiérarchie mémoire :
+
+* Contrôleur du I-cache : recherche, défaut avec requête AXI, remplissage mot par mot, invalidation complète pour FENCE.I.
+* Contrôleur du D-cache : recherche, éviction d'une ligne sale, remplissage, réécriture de toutes les lignes sales pour FENCE.I, arbitrage entre le cœur et le parcoureur de tables de pages.
+* Unité atomique, intégrée au contrôleur du D-cache : séquence lecture, calcul, écriture pour les AMO, réservation pour LR/SC.
+* Parcoureur de tables de pages : lecture du PTE de niveau 1 via le D-cache, puis de niveau 0 si besoin, fin sur succès ou faute.
+* Diviseur itératif : compteur sur 32 cycles et cas particuliers.
+
+Dans le SoC :
+
+* Arbitre AXI entre I-cache et D-cache, en round-robin ou à priorité fixe.
+* Pont AXI4 vers AXI4-Lite pour les périphériques.
+* UART : FSM d'émission, FSM de réception, générateur de baud.
+* Séquenceur de reset.
+
+=== Carte de développement
+
+Le projet est mené sans carte. La cible de référence reste l'Artix-7 XC7A100T de la Nexys A7-100T (128 Mo de DDR2, environ 600 Ko de BRAM) : le design est synthétisé et implémenté sous Vivado pour ce composant, avec le MIG et le fichier de contraintes de Digilent, ce qui ne nécessite pas de carte et garantit que le SoC tient en ressources et en timing. La taille du modèle mémoire en simulation est fixée à 128 Mo pour rester fidèle à cette carte.
+
+Si une carte devient disponible, la Nexys A7-100T est le choix recommandé. La Basys 3 ne convient pas pour Linux faute de RAM externe.
+
+== Outils
+
+[cols="1,2,3",options="header"]
+|===
+| Usage | Outil | Justification
+| Langage RTL | SystemVerilog | Standard de l'industrie pour la conception et la vérification de CPU. Supporté par Vivado et Verilator : rester dans le sous-ensemble commun.
+| Style de code | Guide SystemVerilog de lowRISC, vérifié par Verible | Conventions reconnues (suffixes `_i`, `_o`, `_d`, `_q`, séparation `always_comb` et `always_ff`), code lisible par tout ingénieur.
+| Schémas | draw.io | Gratuit, Windows et Linux, compatible Visio, fichiers XML versionnables. UML non pertinent pour le matériel.
+| Chronogrammes | WaveDrom | Description textuelle versionnable, utilisé par la spec RISC-V.
+| Spécification | AsciiDoc, VS Code, Asciidoctor | Format des specs RISC-V. Tableaux, renvois, inclusions, génération PDF et HTML, intégration WaveDrom via asciidoctor-diagram.
+| Registres | SystemRDL et PeakRDL | Standard Accellera, génération automatique RTL, en-têtes C et documentation.
+| Simulation | Verilator | Simulation rapide de tout le SoC sur PC, utilisée en production par de nombreuses équipes RISC-V. L'option `--savable` permet de sauvegarder et restaurer l'état du modèle RTL généré, base de l'outil de checkpoint. Le reste (modèle mémoire, modèle UART, état du harnais) doit être sérialisé par le code C++ du banc de test.
+| Bancs de test | cocotb (Python) pour les modules, C++ pour le SoC | cocotb progresse fortement en industrie et accélère l'écriture des tests unitaires.
+| Modèle de référence | Spike, utilisé comme bibliothèque dans un harnais de co-simulation | Spike n'a ni l'UART Lite ni un CLINT synchronisé avec le RTL : lancé seul, il divergerait dès la première lecture de `mtime`, d'un registre d'UART ou la première interruption. Comme dans la co-simulation d'Ibex, le banc de test avance Spike instruction par instruction à chaque retrait signalé par RVFI, lui recopie les valeurs lues dans les régions MMIO, lui injecte les interruptions via `mip`, et masque ou recopie les compteurs.
+| Conformité ISA | riscv-arch-test, riscv-tests | riscv-arch-test est la suite officielle de conformité de RISC-V International. Sa version actuelle repose sur le framework ACT4 (RISCOF étant déprécié) et prend Sail comme modèle de référence. Il faut écrire les macros RVMODEL propres au SoC, y compris celles qui déclenchent les interruptions, et activer les tests privilégiés au lot 2. riscv-tests la complète avec des tests unitaires simples, pratiques aux premiers pas du cœur.
+| Tests aléatoires | riscv-dv en mode pygen (Python), ou FORCE-RISCV | Génération de programmes aléatoires pour trouver les cas limites. La version principale de riscv-dv est écrite en SystemVerilog et UVM et demande un simulateur commercial (VCS, Xcelium, Questa) : seule sa variante Python, plus lente, est utilisable avec des outils libres. FORCE-RISCV cible RV64 par défaut, sa configuration pour `rv32ima` est à vérifier.
+| Formel | riscv-formal (via RVFI), SymbiYosys, assertions | riscv-formal effectue du model checking borné de la conformité ISA, et non des preuves complètes, et ne couvre pas la MMU. Le frontend SystemVerilog natif de Yosys étant limité, le plugin yosys-slang est nécessaire pour lire le RTL, ce qui demande d'adapter les scripts de riscv-formal. Les assertions SVA concurrentes passent normalement par le frontend commercial Verific : leur support par yosys-slang est à vérifier, sinon les propriétés sont écrites en assertions immédiates dans des blocs `always` avec `$past`.
+| Visualisation pipeline | Konata | Affichage instruction par instruction du pipeline pour le débogage et les vidéos. Le banc de test doit produire un journal au format Kanata à partir des événements du pipeline.
+| Synthèse | Vivado (édition gratuite, sans carte) | Flot de référence pour Artix-7. Implémentation en out-of-context pour les itérations rapides sur le cœur, et implémentation complète avec le MIG pour les jalons. Bonus FPGA : analyseur logique intégré (ILA) pour le débogage sur carte.
+| Logiciel | Buildroot, OpenSBI (plateforme générique), noyau Linux | Chaîne de compilation, rootfs initramfs, firmware SBI piloté par device tree. L'ISA cible est personnalisée pour `rv32ima` dans Buildroot. Côté noyau, `CONFIG_NONPORTABLE=y` est requis pour sélectionner un noyau 32 bits (`ARCH_RV32I`), et les options `CONFIG_RISCV_ISA_C` et `CONFIG_FPU` se désactivent directement.
+| Versionnement et CI | git, GitHub, GitHub Actions avec un runner auto-hébergé | Régression étagée, voir <<ci>>. Les runners hébergés par GitHub sont limités à 6 heures par job et ne peuvent pas accueillir Vivado.
+| Environnement | Linux pour le code et les outils, Windows possible pour les schémas | Les outils EDA tournent sous Linux en entreprise.
+|===
+
+== Méthodologie
+
+=== Principes
+
+* Spécifier avant de coder : pour chaque phase, la spec d'architecture et les specs de modules concernés sont complètes et relues avant le RTL de cette phase.
+* Les interfaces entre modules sont figées tôt, en tenant compte des besoins du lot 2, et le détail interne de chaque module est spécifié juste avant son implémentation.
+* Chaque spec, puis chaque module RTL, passe par une revue (relecture par Claude) avec corrections et retour d'expérience.
+* Un module n'est terminé que lorsque son plan de vérification est entièrement couvert.
+* Aucune régression tolérée : la CI doit rester verte.
+
+=== Contenu d'une fiche module
+
+* Rôle et place dans le système.
+* Paramètres.
+* Ports, avec direction, largeur et description.
+* Chronogrammes des interfaces.
+* Comportement cycle par cycle, machines à états éventuelles.
+* Cas limites et comportements en cas d'erreur.
+* Plan de vérification : chaque fonctionnalité associée à un test, une assertion ou un point de couverture.
+* Estimation de ressources et chemin critique attendu.
+
+=== Vérification
+
+* Tests unitaires par module (cocotb ou Verilator), assertions et couverture fonctionnelle sur les points critiques.
+* Interface RVFI (RISC-V Formal Interface, qui décrit chaque instruction retirée : PC, registres lus et écrits, accès mémoire) exposée à l'étage de retrait dès la conception, pour riscv-formal et la co-simulation.
+* Harnais de co-simulation Spike, actif dès le premier programme exécuté par le cœur.
+* riscv-arch-test, puis génération de tests aléatoires (riscv-dv en mode pygen ou FORCE-RISCV).
+* Vérification formelle ciblée avec SymbiYosys.
+* Plan de vérification du parcoureur de tables de pages couvrant tous les cas de faute de la section Sv32 : mégapage mal alignée, page inscriptible non lisible, PTE non feuille (R = W = X = 0) au niveau 0, règles U, SUM et MXR.
+* Outils maison, construits uniquement quand le besoin est réellement ressenti :
+** checkpoint du démarrage de Linux : sauvegarder l'état du modèle RTL avec `--savable` de Verilator, et celui du modèle mémoire et des modèles de périphériques par le banc de test, peu avant un bug, puis rejouer à partir de ce point sans refaire des centaines de millions d'instructions. Spike n'offrant pas de sauvegarde d'état, les exécutions restaurées tournent sans co-simulation, le débogage s'appuyant alors sur les traces et les formes d'onde ;
+** réduction automatique des programmes qui font échouer le cœur.
+
+[[ci]]
+=== Intégration continue
+
+* À chaque commit : lint, tests unitaires, sous-ensemble de riscv-arch-test, co-simulation courte.
+* Chaque nuit : riscv-arch-test complet, tests aléatoires, vérification formelle, CoreMark.
+* À chaque jalon : démarrage de Linux en simulation, implémentation Vivado complète.
+
+Les jobs longs tournent sur un runner auto-hébergé (jusqu'à 5 jours par job), qui accueille aussi Vivado.
+
+=== Performance
+
+* Estimation avant implémentation : CPI = 1 + somme des pénalités (branchements mal prédits, bulles load-use et multiplication, défauts de cache, divisions, vidages liés aux CSR), à partir de traces Spike de CoreMark et d'un petit modèle Python des caches et du prédicteur.
+* Mesure après implémentation, puis explication de l'écart.
+* Objectifs fermes sur ce qui est contrôlé : démarrage de Linux, fréquence cible (50 à 100 MHz sur Artix-7, vérifiée par l'analyse de timing de Vivado), ressources. Objectif de performance dérivé de l'estimation, en CoreMark/MHz, avec comme repère un ordre de grandeur de 2 à 3,5 CoreMark/MHz pour les cœurs open source in-order comparables, selon leurs options (multiplicateur, prédiction de branchement).
+* Chaque optimisation suit le cycle : estimation du gain, implémentation, mesure, explication.
+
+=== Pratiques de projet
+
+* Commits petits et fréquents, branches par fonctionnalité.
+* Chaque bug tracé dans une issue GitHub avec sa cause racine et sa correction.
+* Journal de bord quotidien dans le dépôt : travail effectué, bugs, choix et leurs raisons, captures de formes d'onde et de Konata.
+* README avec mesures chiffrées : IPC sur CoreMark, fréquence atteinte, ressources FPGA, taux de mauvaise prédiction, taux de défaut des caches.
+* Vidéos produites après le projet, à partir du journal de bord.
+
+== Ordre des tâches
+
+L'enchaînement suit le flot d'une équipe de conception : exigences, architecture, microarchitecture et plan de vérification, puis RTL et vérification unitaire, intégration, vérification système, synthèse, et prototypage FPGA en bonus. Chaque phase se termine par une revue et un critère de sortie.
+
+=== Phase 0 : mise en place
+
+. Créer le dépôt et son arborescence : `doc/`, `rtl/`, `dv/`, `sw/`, `fpga/`, `tools/`, `journal/`.
+. Installer la chaîne d'outils : compilateur RISC-V, Spike, Sail, Verilator, Verible, cocotb, Yosys avec yosys-slang, SymbiYosys, Asciidoctor, PeakRDL, `dtc`, Vivado.
+. Mettre en place la CI et le runner auto-hébergé : lint Verible, compilation Verilator, génération de la documentation.
+. Écrire un module trivial avec son test pour valider toute la chaîne de bout en bout, y compris une synthèse Vivado.
+. Vérifier les points listés dans <<a-verifier>>.
+. Lire la documentation du lot 1 et les lectures anticipées du lot 2 (voir <<lectures>>).
+
+Critère de sortie : un commit déclenche automatiquement lint, simulation et génération de documentation.
+
+=== Phase 1 : spécification d'architecture
+
+. Rédiger les exigences : ISA de chaque lot, objectifs de fréquence et de ressources, cibles de démarrage.
+. Définir la carte mémoire : ROM, DDR, CLINT, UART, esclave par défaut, attributs cachable ou non par région. Placer la DDR à l'adresse `0x8000_0000`, convention suivie par OpenSBI, Linux et la plupart des plateformes RISC-V, et le CLINT à `0x0200_0000` pour s'aligner sur Spike (à confirmer). Décider si la ROM est cachable pour le I-cache (possible car elle est en lecture seule) ou lue sans cache.
+. Définir la stratégie d'exceptions et d'interruptions : MEM comme point de validation, ordre des vérifications dans cet étage, priorités, vidage, point d'injection, politique des erreurs de bus.
+. Dessiner le schéma de blocs global du SoC et du cœur.
+. Définir les interfaces entre blocs, en y prévoyant les signaux du lot 2 inactifs au lot 1 : côté données, type d'accès (load, store, AMO, LR/SC), privilège effectif (MPRV, MPP, SUM, MXR), résultat de traduction, fautes de page et d'accès, SFENCE.VMA, vidage et réécriture du cache ; côté instructions, traduction par l'ITLB et faute de page instruction. Protocole de chaque bus, chronogrammes WaveDrom.
+. Établir l'estimation de performance initiale à partir des traces Spike.
+. Revue de la spec d'architecture.
+
+Critère de sortie : spec d'architecture relue, interfaces figées.
+
+=== Phase 2 : microarchitecture du cœur RV32IM et environnement de vérification
+
+. Rédiger les fiches modules du cœur, chacune avec son plan de vérification : package de types communs, banc de registres, ALU, décodeur, multiplicateur, diviseur, unité CSR en mode machine, étages du pipeline, unité de détection d'aléas et de forwarding, interface RVFI.
+. Rédiger la fiche du harnais de co-simulation : appel de Spike pas à pas sur RVFI, recopie des lectures MMIO, injection de `mip`, traitement des compteurs.
+. Revue des fiches.
+
+Critère de sortie : toutes les fiches du cœur et du harnais relues.
+
+=== Phase 3 : RTL et vérification du cœur
+
+Ordre d'implémentation, chaque module étant validé unitairement avant de passer au suivant :
+
+. Package de types et constantes.
+. Banc de registres, avec bypass interne.
+. ALU.
+. Décodeur, WFI compris.
+. Multiplicateur à 2 cycles, puis diviseur itératif.
+. Unité CSR en mode machine avec les CSR du lot 1 et les traps (ECALL, EBREAK, instruction illégale, accès non aligné, MRET). Le CSR `time` lit une valeur provisoire jusqu'à l'arrivée du CLINT.
+. Harnais de co-simulation Spike.
+. Intégration du pipeline avec une mémoire idéale à un cycle, sans cache, prédiction statique « non pris ».
+. Exécution des premiers programmes sous co-simulation, journal Kanata pour Konata.
+. riscv-arch-test pour RV32IM et Zicsr, macros RVMODEL comprises, complété par des tests dédiés aux compteurs.
+. Tests aléatoires, assertions, riscv-formal.
+. Première synthèse Vivado en out-of-context pour vérifier le timing du cœur seul.
+
+Critère de sortie (M1) : conformité ISA complète, co-simulation sans divergence sur les tests aléatoires, timing estimé compatible avec la cible.
+
+=== Phase 4 : hiérarchie mémoire et SoC
+
+. Fiches modules : I-cache, D-cache, arbitre AXI, esclave par défaut, pont AXI4-Lite, CLINT, UART, ROM de démarrage, séquenceur de reset, prédicteur de branchement dynamique, blocs de registres en SystemRDL. Revue.
+. Modèle mémoire AXI pour la simulation, avec préchargement d'image par le banc de test.
+. I-cache, validé seul puis avec le cœur.
+. D-cache write-through avec tampon d'écriture et contournement des régions non cachables, validé seul puis avec le cœur.
+. D-cache write-back, comparaison mesurée avec la version write-through.
+. FENCE.I et cohérence I/D, riscv-arch-test pour Zifencei.
+. Arbitre AXI, décodage d'adresses, esclave par défaut et fautes d'accès.
+. Périphériques : CLINT (interruption timer machine via `mie`, `mip` et `mstatus.MIE`, CSR `time` raccordé à `mtime`), UART avec registres externes, ROM de démarrage, avec leurs blocs de registres générés par PeakRDL. Extension du harnais de co-simulation aux lectures MMIO et aux interruptions.
+. Device tree minimal du SoC, compilé et vérifié par `dtc`, intégré à la ROM.
+. Intégration du SoC en simulation. Un modèle UART dans le banc de test décode la ligne série et l'affiche dans le terminal.
+. Prédiction dynamique : BTB, compteurs 2 bits, RAS.
+. CoreMark : mesure de l'IPC, des taux de défaut et de mauvaise prédiction, comparaison avec l'estimation.
+
+Critère de sortie (M2) : SoC complet exécutant CoreMark en simulation, écarts de performance expliqués.
+
+=== Phase 5 : synthèse et fermeture du timing, sans carte
+
+. Créer le projet Vivado ciblant le XC7A100T, avec le fichier de contraintes de Digilent pour la Nexys A7.
+. Générer le MIG pour la DDR2 de la Nexys A7 et l'intégrer au SoC de synthèse à la place du modèle mémoire.
+. Décider de l'horloge du SoC : horloge utilisateur du MIG, ou franchissement de domaine d'horloge à ajouter aussi en simulation.
+. Implémenter le SoC complet, analyser le rapport de timing, corriger les chemins critiques jusqu'à tenir la fréquence cible.
+. Conserver un flot out-of-context, avec contraintes d'entrée et de sortie sur les ports, pour les itérations rapides sur le cœur.
+. Relever les ressources utilisées (LUT, bascules, BRAM, DSP) pour le README.
+
+Critère de sortie (M3) : SoC complet avec MIG implémenté sans violation de timing à la fréquence cible, ressources compatibles avec l'Artix-7 100T.
+
+=== Phase 6 : support de Linux
+
+. Relire en détail la documentation du lot 2 (voir <<lectures>>).
+. Mettre à jour la spec d'architecture : modes S et U, délégation, Sv32, extension A, CSR du lot 2.
+. Fiches modules : unité CSR complète, TLB, parcoureur de tables de pages, unité atomique, et mise à jour des fiches des caches (chemin d'étiquette physique, fautes, port du parcoureur, atomiques). Revue.
+. Extension A : LR/SC et AMO dans le D-cache.
+. Modes superviseur et utilisateur, délégation des traps et interruptions, CSR et bits du lot 2, WFI réel (attente d'interruption).
+. TLB, parcoureur de tables de pages passant par le D-cache, mégapages, traduction sous MPRV, SFENCE.VMA.
+. riscv-arch-test avec les tests privilégiés, co-simulation en mode privilégié.
+. Compléter le device tree et configurer OpenSBI en plateforme générique, qui découvre le matériel à partir du device tree.
+. Démarrer OpenSBI en simulation : première validation réelle du device tree.
+. Construire le noyau et l'initramfs avec Buildroot pour `rv32ima`, configuration réduite au minimum pour raccourcir le démarrage, `timebase-frequency` choisie pour limiter le nombre de cycles simulés.
+. Optimiser la simulation : build Verilator optimisé sans trace, traces activées seulement autour des zones à déboguer.
+. Développer l'outil de checkpoint basé sur `--savable`.
+. Démarrer Linux en simulation.
+
+Critère de sortie (M4) : shell Linux accessible par l'UART simulée, redirigée vers le terminal.
+
+=== Phase 7 : superscalaire de largeur 2
+
+. Estimer le gain attendu.
+. Mettre à jour les specs : chargement de 2 instructions par cycle et franchissement de ligne de cache, double décodage, dépendances intra-cycle, règles d'appariement (un seul port vers le D-cache, donc un seul accès mémoire par cycle), ports du banc de registres, nouveaux chemins de forwarding, RVFI avec deux retraits par cycle.
+. Implémentation, vérification complète, non-régression Linux.
+. Mesure et explication de l'écart avec l'estimation.
+
+Critère de sortie (M5) : Linux démarre toujours, gain mesuré et expliqué.
+
+=== Phase 8 : out-of-order
+
+. Estimer le gain attendu.
+. Spécifier : renommage, tampon de réordonnancement (ROB), files d'émission, exceptions précises au commit, unité load/store, caches non bloquants si nécessaire. Choisir la largeur : 1 pour limiter la complexité, ou 2 pour réutiliser le travail de la phase 7.
+. Périmètre initial volontairement réduit : accès mémoire exécutés dans l'ordre, accès non cachables exécutés uniquement en tête du ROB (ils ne doivent jamais être spéculatifs), récupération des mauvaises prédictions au commit plutôt que par checkpoints de renommage. Ces simplifications pourront être levées une fois le cœur stable.
+. Implémentation par étapes, co-simulation active en permanence.
+. riscv-arch-test, co-simulation et CoreMark, puis démarrage de Linux en objectif étendu.
+. Mesure et explication.
+
+Critère de sortie (M6) : cœur out-of-order validé par riscv-arch-test, la co-simulation et CoreMark, gain mesuré et expliqué. Linux sur ce cœur est un objectif étendu.
+
+=== Phase 9 : valorisation
+
+. Finaliser le README et la documentation.
+. Préparer les vidéos à partir du journal de bord, voix en français et en anglais.
+
+=== Bonus : portage sur FPGA
+
+À insérer dès qu'une carte est disponible, idéalement après le jalon M4. Le MIG et les horloges étant déjà intégrés en phase 5, il s'agit de valider le matériel réel.
+
+. Chargeur d'image par UART dans la ROM de démarrage, ou lecture depuis la microSD via SPI.
+. Mettre en place l'ILA et une trace des instructions retirées.
+. Exécuter les tests et CoreMark sur carte, comparer avec la simulation.
+. Démarrer Linux sur carte.
+
+Critère de sortie : shell Linux accessible par l'UART de la Nexys A7.
+
+[[lectures]]
+== Documentation RISC-V à lire
+
+Numérotation du PDF de la version 20260120 des manuels officiels.
+
+=== Lot 1 : cœur RV32IM et SoC
+
+Volume I :
+
+* Chapitre 1, en entier, notamment 1.5 (encodage de la longueur des instructions) et 1.6 (exceptions, traps et interruptions).
+* Chapitre 2, RV32I en entier, les HINTs peuvent être survolés.
+* Chapitre 5, Zifencei, à lire au plus tard avant les caches.
+* Chapitre 6, Zicsr.
+* Chapitre 7, uniquement Zicntr.
+* Chapitre 12, extension M.
+* Chapitre 36, uniquement les tables RV32I, RV32M, Zicsr et Zifencei.
+
+Volume II, pour le mode machine dès le lot 1 :
+
+* 2.1 et 2.3 (organisation des CSR, champs WPRI, WLRL, WARL).
+* 3.1.1 à 3.1.5 (`misa`, identifiants, `mhartid`), 3.1.6.1 (pile d'activation des interruptions dans `mstatus`), 3.1.7 (`mtvec`), 3.1.9 (`mip`, `mie`), 3.1.10 (compteurs), 3.1.13 à 3.1.16 (`mscratch`, `mepc`, `mcause`, `mtval`), 3.2 (`mtime`, `mtimecmp`), 3.3.1 à 3.3.3 (ECALL, EBREAK, MRET, WFI).
+
+Lectures anticipées du lot 2, pour concevoir les interfaces en phase 1 :
+
+* Volume I : chapitre 13, extension A.
+* Volume II : 3.1.6.4 (MPRV, SUM, MXR), 3.1.8 (délégation), 12.1.11 (`satp`), 12.3 (Sv32).
+
+=== Lot 2 : Linux
+
+Volume I :
+
+* Chapitre 13, extension A, relu en détail.
+* Début du chapitre 18, définition du modèle RVWMO, pour comprendre FENCE.
+
+Volume II :
+
+* 1.1 et 1.2.
+* 2.2.1, 2.2.2, 2.2.4 et 2.7, avec relecture de 2.1 et 2.3.
+* 3.1.6 avec 3.1.6.1, 3.1.6.4 et 3.1.6.6 (TW, TVM, TSR), 3.1.7 à 3.1.16, 3.2, 3.3.1 à 3.3.3, 3.4.
+* À survoler : 3.1.18 (menvcfg), 3.6.1 et 3.6.3 (PMA), 3.7 (PMP).
+* 12.1.1 avec 12.1.1.2, 12.1.2 à 12.1.9, 12.1.11 (satp), 12.2.1 (SFENCE.VMA), 12.3 en entier (Sv32).
+* Chapitre 19, encodages des instructions privilégiées.
+* Optionnel : chapitre 13 (Sstc) et 12.1.12.
+
+Références complémentaires : _Computer Organization and Design, RISC-V Edition_ (Patterson et Hennessy) pour le pipeline, _The RISC-V Reader_ (Patterson et Waterman) pour une vue d'ensemble de l'ISA, documentation de la co-simulation d'Ibex pour le harnais.
+
+[[a-verifier]]
+== Points à vérifier en début de projet
+
+* Adresses par défaut du CLINT et de la mémoire dans le Spike actuel, et possibilité de l'utiliser pas à pas comme bibliothèque sans le modifier.
+* Support des assertions SVA concurrentes par yosys-slang.
+* Exigence stricte de l'extension A par OpenSBI.
+* Périmètre de riscv-dv pygen en mode privilégié et avec MMU, et configuration de FORCE-RISCV pour `rv32ima`.
+* Versions minimales du noyau et d'OpenSBI pour la console SBI via DBCN (introduite dans OpenSBI 1.3, à l'état expérimental), et version d'OpenSBI qui lit `riscv,isa-extensions`.
+* Périmètre exact de `--savable` dans Verilator, et absence de sauvegarde d'état dans Spike.
+* Numérotation exacte des sections 1.5 et 1.6 du volume I dans le PDF.
+
+== Risques identifiés
+
+[cols="2,3",options="header"]
+|===
+| Risque | Mitigation
+| Durée longue (estimée à 6 à 10 mois à plein temps jusqu'à Linux, de l'ordre de 12 à 18 mois au total) et risque de perte d'élan | Jalons valorisables indépendamment, résultats visibles à chaque phase, marge explicite avant M4, candidatures possibles dès M4, Linux sur le cœur out-of-order défini comme objectif étendu.
+| Dérive du périmètre (ajout de fonctionnalités en cours de route) | Toute nouvelle fonctionnalité passe par une mise à jour de la spec et une estimation avant d'être acceptée.
+| Bugs tardifs difficiles à localiser | Harnais de co-simulation dès le premier programme, RVFI, tests aléatoires, checkpoints.
+| Divergences de co-simulation dues aux périphériques et au temps | Harnais qui recopie les lectures MMIO et injecte les interruptions dans Spike, carte mémoire alignée sur celle de Spike.
+| Démarrage de Linux très lent en simulation, sans FPGA pour accélérer | Checkpoints `--savable`, build optimisé sans trace, `timebase-frequency` adaptée, noyau et initramfs réduits au minimum.
+| Interfaces à reprendre au lot 2 | Exigences structurantes du lot 2 lues et intégrées aux interfaces dès la phase 1.
+| Écart entre simulation et matériel lors d'un futur portage FPGA | Implémentation Vivado complète avec MIG dès la phase 5, modèle mémoire AXI à latence réaliste.
+| Incompatibilités entre Vivado et Verilator | Sous-ensemble SystemVerilog commun, synthèse régulière.
+| Timing non tenu | Synthèse dès la phase 3, configuration de repli des caches.
+| Erreurs de device tree | Device tree minimal vérifié par `dtc` en phase 4, première validation réelle par OpenSBI en phase 6, avant Linux.
+| Avenir incertain de RV32 dans le noyau Linux : RV64 est bien mieux maintenu et des discussions sur la séparation ou la réduction du support RV32 ont eu lieu | Figer une version LTS du noyau et de Buildroot connue pour fonctionner en RV32, et suivre la liste linux-riscv. Le passage à RV64 reste une évolution possible, mais touche tout le chemin de données.
+|===
